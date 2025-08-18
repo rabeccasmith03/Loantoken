@@ -17,6 +17,11 @@
 (define-constant err-collateral-not-found (err u112))
 (define-constant err-invalid-collateral-ratio (err u113))
 (define-constant err-loan-not-defaulted (err u114))
+(define-constant err-not-authorized-servicer (err u115))
+(define-constant err-servicer-already-assigned (err u116))
+(define-constant err-invalid-servicer-fee (err u117))
+(define-constant err-servicer-not-found (err u118))
+(define-constant err-servicer-suspended (err u119))
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-loans-issued uint u0)
@@ -72,6 +77,42 @@
 
 (define-data-var liquidation-penalty uint u10)
 (define-data-var min-collateral-ratio uint u150)
+
+(define-map loan-servicers
+  uint
+  {
+    servicer: principal,
+    fee-percentage: uint,
+    assigned-block: uint,
+    is-active: bool,
+    payments-processed: uint,
+    total-fees-earned: uint
+  }
+)
+
+(define-map servicer-profiles
+  principal
+  {
+    is-registered: bool,
+    is-suspended: bool,
+    total-loans-serviced: uint,
+    total-payments-processed: uint,
+    reputation-score: uint,
+    registration-block: uint
+  }
+)
+
+(define-map servicer-disputes
+  {servicer: principal, loan-id: uint}
+  {
+    dispute-reason: uint,
+    filed-block: uint,
+    is-resolved: bool,
+    resolution-block: uint
+  }
+)
+
+(define-data-var max-servicer-fee uint u500)
 
 (define-public (get-last-token-id)
   (ok (var-get last-token-id))
@@ -475,3 +516,244 @@
     min-ratio: (var-get min-collateral-ratio)
   })
 )
+
+(define-public (register-servicer)
+  (let
+    (
+      (existing-profile (default-to {is-registered: false, is-suspended: false, total-loans-serviced: u0, total-payments-processed: u0, reputation-score: u100, registration-block: u0} (map-get? servicer-profiles tx-sender)))
+    )
+    (asserts! (not (get is-registered existing-profile)) err-servicer-already-assigned)
+    
+    (map-set servicer-profiles tx-sender
+      {
+        is-registered: true,
+        is-suspended: false,
+        total-loans-serviced: u0,
+        total-payments-processed: u0,
+        reputation-score: u100,
+        registration-block: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (assign-servicer (token-id uint) (servicer principal) (fee-percentage uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loan-details token-id) err-loan-not-found))
+      (loan-owner (unwrap! (nft-get-owner? student-loan token-id) err-not-token-owner))
+      (servicer-profile (unwrap! (map-get? servicer-profiles servicer) err-servicer-not-found))
+      (existing-assignment (map-get? loan-servicers token-id))
+    )
+    (asserts! (is-eq tx-sender loan-owner) err-not-token-owner)
+    (asserts! (get is-registered servicer-profile) err-servicer-not-found)
+    (asserts! (not (get is-suspended servicer-profile)) err-servicer-suspended)
+    (asserts! (<= fee-percentage (var-get max-servicer-fee)) err-invalid-servicer-fee)
+    (asserts! (is-none existing-assignment) err-servicer-already-assigned)
+    (asserts! (get is-active loan) err-loan-already-paid)
+    
+    (map-set loan-servicers token-id
+      {
+        servicer: servicer,
+        fee-percentage: fee-percentage,
+        assigned-block: stacks-block-height,
+        is-active: true,
+        payments-processed: u0,
+        total-fees-earned: u0
+      }
+    )
+    
+    (map-set servicer-profiles servicer
+      (merge servicer-profile
+        {
+          total-loans-serviced: (+ (get total-loans-serviced servicer-profile) u1)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-servicer (token-id uint))
+  (let
+    (
+      (loan-owner (unwrap! (nft-get-owner? student-loan token-id) err-not-token-owner))
+      (servicer-assignment (unwrap! (map-get? loan-servicers token-id) err-servicer-not-found))
+    )
+    (asserts! (is-eq tx-sender loan-owner) err-not-token-owner)
+    (asserts! (get is-active servicer-assignment) err-servicer-not-found)
+    
+    (map-set loan-servicers token-id
+      (merge servicer-assignment {is-active: false})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (servicer-collect-payment (token-id uint) (payment-amount uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loan-details token-id) err-loan-not-found))
+      (servicer-assignment (unwrap! (map-get? loan-servicers token-id) err-servicer-not-found))
+      (servicer-profile (unwrap! (map-get? servicer-profiles tx-sender) err-servicer-not-found))
+      (loan-owner (unwrap! (nft-get-owner? student-loan token-id) err-not-token-owner))
+      (current-balance (get remaining-balance loan))
+      (payment-history-list (default-to (list) (map-get? payment-history token-id)))
+      (new-balance (if (>= payment-amount current-balance) u0 (- current-balance payment-amount)))
+      (actual-payment (if (>= payment-amount current-balance) current-balance payment-amount))
+      (servicer-fee (/ (* actual-payment (get fee-percentage servicer-assignment)) u10000))
+      (owner-payment (- actual-payment servicer-fee))
+    )
+    (asserts! (is-eq tx-sender (get servicer servicer-assignment)) err-not-authorized-servicer)
+    (asserts! (get is-active servicer-assignment) err-servicer-not-found)
+    (asserts! (not (get is-suspended servicer-profile)) err-servicer-suspended)
+    (asserts! (get is-active loan) err-loan-already-paid)
+    (asserts! (> payment-amount u0) err-invalid-amount)
+    (asserts! (> current-balance u0) err-loan-already-paid)
+    
+    (try! (stx-transfer? actual-payment (get borrower loan) tx-sender))
+    (try! (stx-transfer? owner-payment tx-sender loan-owner))
+    
+    (map-set loan-details token-id
+      (merge loan
+        {
+          remaining-balance: new-balance,
+          payments-made: (+ (get payments-made loan) u1),
+          is-active: (> new-balance u0)
+        }
+      )
+    )
+    
+    (map-set loan-servicers token-id
+      (merge servicer-assignment
+        {
+          payments-processed: (+ (get payments-processed servicer-assignment) u1),
+          total-fees-earned: (+ (get total-fees-earned servicer-assignment) servicer-fee)
+        }
+      )
+    )
+    
+    (map-set servicer-profiles tx-sender
+      (merge servicer-profile
+        {
+          total-payments-processed: (+ (get total-payments-processed servicer-profile) u1)
+        }
+      )
+    )
+    
+    (map-set payment-history token-id
+      (unwrap! (as-max-len? 
+        (append payment-history-list 
+          {block: stacks-block-height, amount: actual-payment, remaining: new-balance}) 
+        u100) 
+        err-payment-failed)
+    )
+    
+    (ok {fee-earned: servicer-fee, new-balance: new-balance})
+  )
+)
+
+(define-public (file-servicer-dispute (token-id uint) (reason uint))
+  (let
+    (
+      (loan-owner (unwrap! (nft-get-owner? student-loan token-id) err-not-token-owner))
+      (servicer-assignment (unwrap! (map-get? loan-servicers token-id) err-servicer-not-found))
+      (servicer (get servicer servicer-assignment))
+    )
+    (asserts! (is-eq tx-sender loan-owner) err-not-token-owner)
+    (asserts! (get is-active servicer-assignment) err-servicer-not-found)
+    (asserts! (<= reason u10) err-invalid-amount)
+    
+    (map-set servicer-disputes {servicer: servicer, loan-id: token-id}
+      {
+        dispute-reason: reason,
+        filed-block: stacks-block-height,
+        is-resolved: false,
+        resolution-block: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-servicer-dispute (servicer principal) (loan-id uint) (resolution bool))
+  (let
+    (
+      (dispute (unwrap! (map-get? servicer-disputes {servicer: servicer, loan-id: loan-id}) err-servicer-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get is-resolved dispute)) err-servicer-not-found)
+    
+    (map-set servicer-disputes {servicer: servicer, loan-id: loan-id}
+      (merge dispute
+        {
+          is-resolved: true,
+          resolution-block: stacks-block-height
+        }
+      )
+    )
+    
+    (if (not resolution)
+      (map-set servicer-profiles servicer
+        (merge (unwrap! (map-get? servicer-profiles servicer) err-servicer-not-found)
+          {
+            is-suspended: true,
+            reputation-score: (let ((current-score (get reputation-score (unwrap! (map-get? servicer-profiles servicer) err-servicer-not-found)))) (if (> current-score u10) (- current-score u10) u0))
+          }
+        )
+      )
+      true
+    )
+    
+    (ok resolution)
+  )
+)
+
+(define-public (update-servicer-settings (max-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= max-fee u2000) err-invalid-servicer-fee)
+    
+    (var-set max-servicer-fee max-fee)
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-loan-servicer (token-id uint))
+  (map-get? loan-servicers token-id)
+)
+
+(define-read-only (get-servicer-profile (servicer principal))
+  (map-get? servicer-profiles servicer)
+)
+
+(define-read-only (get-servicer-dispute (servicer principal) (loan-id uint))
+  (map-get? servicer-disputes {servicer: servicer, loan-id: loan-id})
+)
+
+(define-read-only (calculate-servicer-fee (token-id uint) (payment-amount uint))
+  (match (map-get? loan-servicers token-id)
+    assignment-data
+      (let
+        (
+          (fee-percentage (get fee-percentage assignment-data))
+        )
+        (ok (/ (* payment-amount fee-percentage) u10000))
+      )
+    (ok u0)
+  )
+)
+
+(define-read-only (get-servicer-settings)
+  (ok {
+    max-fee: (var-get max-servicer-fee)
+  })
+)
+
+
