@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Loantoken.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.loan-insurance]
+path = 'contracts/loan-insurance.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
